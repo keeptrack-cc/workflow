@@ -1,0 +1,109 @@
+name: Reusable VPS Deployment
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Docker Compose service name"
+        required: true
+        type: string
+      project_path:
+        description: "Remote path under ~/ on the VPS"
+        required: true
+        type: string
+      port:
+        description: "Optional TCP port to allow in UFW"
+        required: false
+        default: ""
+        type: string
+      rsync_excludes:
+        description: "Space-separated extra --exclude patterns for rsync"
+        required: false
+        default: ""
+        type: string
+      pass_build_meta:
+        description: "Pass DEPLOY_TIMESTAMP and GIT_TAG build args to docker compose build"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      USER:
+        required: true
+      HOST:
+        required: true
+      SSH_KEY:
+        required: true
+      ENV_FILE:
+        description: "Optional .env file contents to write on the VPS"
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "Deploying ${{ inputs.service_name }} (${TAG_NAME})"
+          echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync files to VPS
+        run: |
+          ssh -o StrictHostKeyChecking=no "${{ secrets.USER }}@${{ secrets.HOST }}" "mkdir -p '${{ inputs.project_path }}'"
+
+          EXTRA_EXCLUDES=""
+          for pat in ${{ inputs.rsync_excludes }}; do
+            EXTRA_EXCLUDES="${EXTRA_EXCLUDES} --exclude=${pat}"
+          done
+
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='.env.*' \
+            ${EXTRA_EXCLUDES} \
+            -e "ssh -o StrictHostKeyChecking=no" \
+            ./ "${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.project_path }}"
+
+      - name: Write remote .env (if ENV_FILE secret provided)
+        if: secrets.ENV_FILE != ''
+        env:
+          ENV_FILE_CONTENT: ${{ secrets.ENV_FILE }}
+        run: |
+          TMP_ENV="$(mktemp)"
+          trap 'rm -f "$TMP_ENV"' EXIT
+          printf '%s\n' "$ENV_FILE_CONTENT" > "$TMP_ENV"
+          scp -o StrictHostKeyChecking=no "$TMP_ENV" "${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.project_path }}/.env"
+          ssh -o StrictHostKeyChecking=no "${{ secrets.USER }}@${{ secrets.HOST }}" "chmod 600 '${{ inputs.project_path }}/.env'"
+
+      - name: Build and restart container on VPS
+        run: |
+          ssh -o StrictHostKeyChecking=no "${{ secrets.USER }}@${{ secrets.HOST }}" "
+            set -e
+            if [ -n '${{ inputs.port }}' ]; then
+              (command -v ufw >/dev/null 2>&1 && sudo ufw allow '${{ inputs.port }}/tcp' comment '${{ inputs.service_name }}' 2>/dev/null && sudo ufw reload 2>/dev/null || true)
+            fi
+            cd '${{ inputs.project_path }}'
+            if [ '${{ inputs.pass_build_meta }}' = 'true' ]; then
+              DEPLOY_TIMESTAMP=\$(date -u +%Y%m%d%H%M%S)
+              GIT_TAG='${{ steps.tag.outputs.tag }}'
+              docker compose build --no-cache --build-arg DEPLOY_TIMESTAMP=\$DEPLOY_TIMESTAMP --build-arg GIT_TAG=\$GIT_TAG '${{ inputs.service_name }}'
+            else
+              docker compose build --no-cache '${{ inputs.service_name }}'
+            fi
+            docker compose up -d --force-recreate '${{ inputs.service_name }}'
+            sleep 3
+            docker compose ps
+          "
