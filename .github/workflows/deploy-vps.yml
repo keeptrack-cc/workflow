@@ -78,10 +78,13 @@ jobs:
             ./ "${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.project_path }}"
 
       - name: Write remote .env (if ENV_FILE secret provided)
-        if: secrets.ENV_FILE != ''
         env:
           ENV_FILE_CONTENT: ${{ secrets.ENV_FILE }}
         run: |
+          if [ -z "$ENV_FILE_CONTENT" ]; then
+            echo "ENV_FILE secret not set; skipping .env upload."
+            exit 0
+          fi
           TMP_ENV="$(mktemp)"
           trap 'rm -f "$TMP_ENV"' EXIT
           printf '%s\n' "$ENV_FILE_CONTENT" > "$TMP_ENV"
